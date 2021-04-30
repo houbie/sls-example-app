@@ -1,0 +1,119 @@
+service: sls-example-app
+
+frameworkVersion: '2'
+
+plugins:
+  - serverless-pseudo-parameters
+  - serverless-plugin-log-subscription
+  - serverless-python-requirements
+  - serverless-wsgi
+  - serverless-dynamodb-local
+
+package:
+  include:
+    - '!./**' # this pattern speeds up packaging
+    - './sam-example-app/**'
+    - api*.yaml
+  exclude:
+    - '**'
+
+provider:
+  name: aws
+  region: ${opt:region, 'eu-west-1'}
+  stage: ${opt:stage, 'dev'}
+  endpointType: REGIONAL
+
+  deploymentBucket:
+    name: houbie-cf-stacks
+  versionFunctions: false
+
+  logRetentionInDays: 7
+
+  runtime: python3.8
+
+  environment:
+    EVENT_LOG_TABLE: '#{EventLogTable}'
+
+  iamRoleStatements:
+    - Effect: "Allow"
+      Action:
+        - dynamodb:*
+      Resource: '#{EventLogTable.Arn}'
+    - Effect: "Allow"
+      Action:
+        - s3:*
+      Resource: '#{SlsAppBucket.Arn}'
+custom:
+  envName: ${file(serverless/env/${self:provider.stage}.yml):envName}
+  functionPrefix: ${self:service}-${self:provider.stage}
+  domainName: ${file(serverless/env/${self:provider.stage}.yml):domainName}
+  basePath: 'holiday-service'
+
+  pythonRequirements:
+    noDeploy:
+      - boto3
+      - botocore
+  wsgi:
+    app: holiday_service/holiday_lambda.app
+    textMimeTypes:
+      - application/problem+json
+
+  dynamodb:
+    stages:
+      - local
+
+  lambdaLogSubscription:
+    name: tracing-forwarder
+    logIngestionFunctionName: ${self:provider.org}-tracinglogs2newrelic-${self:custom.envName}
+    # only forward the logs that contain _DIST_TRACING_DATA_
+    filterPattern: '_DIST_TRACING_DATA_'
+
+  logSubscription:
+    enabled: true
+    # forward all logs except the ones that contain _DIST_TRACING_DATA_ (notice the '-')
+    filterPattern: '-_DIST_TRACING_DATA_'
+    destinationArn: ${file(serverless/env/${self:provider.stage}.yml):logs-destination-arn}
+    roleArn:
+      Fn::GetAtt: [ CloudWatchRole, Arn ]
+
+functions:
+  hello:
+    name: ${self:custom.functionPrefix}-holidays-lambda
+    handler: wsgi_handler.handler
+    timeout: 10
+    events:
+      - http:
+          method: any
+          path: /{proxy+}
+  EventConsumerFn:
+    name: ${self:service}-event-consumer
+      handler: sam_example_app/event_consumer_lambda.handler
+      events:
+        - http:
+            path: /consumer-events
+            method: post
+        - http:
+            path: /echo/{path_param_1}/{path_param_2}
+            method: get
+
+resources:
+  SlsAppBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+    Properties:
+      BucketName: {{ env("USER").lower() }}-sls-events
+  EventLogTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: ${self:service}-event-log'
+      AttributeDefinitions:
+        - AttributeName: id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: id
+          KeyType: HASH
+      ProvisionedThroughput:
+        ReadCapacityUnits: 5
+        WriteCapacityUnits: 5
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
